@@ -18,6 +18,9 @@ from .models import (
     AuditResponse,
     DaySummary,
     DiagnosticsResponse,
+    ExcludedPairOut,
+    ExclusionRecoveryRequest,
+    ExclusionRecoveryResponse,
     GroupOut,
     ReconcileRequest,
     ReconcileResponse,
@@ -35,6 +38,7 @@ from .solver import (
     Reconciler,
     Txn,
     diagnose_unmatched,
+    recover_exclusions,
     resolve_excluded_pairs,
     resolve_locked_groups,
     resolve_proposed_groups,
@@ -278,6 +282,45 @@ def unmatched_summary(payload: UnmatchedSummaryRequest) -> UnmatchedSummaryRespo
             for day, b in sorted(per_day.items())
         ],
         total=total,
+    )
+
+
+@app.post(
+    "/reconcile/exclusion-recovery",
+    response_model=ExclusionRecoveryResponse,
+)
+def exclusion_recovery(payload: ExclusionRecoveryRequest) -> ExclusionRecoveryResponse:
+    """Suggest the fewest excluded pairs to remove to reach a target total.
+
+    The batch fields are validated exactly as for ``POST /reconcile`` (same
+    400/422 behaviour), and ``excluded_pairs`` is additionally capped at 8
+    entries while ``target_total`` must be a non-negative integer.  The
+    transactions and the locked groups are never changed: the endpoint only
+    searches subsets of excluded pairs to lift, evaluating the canonical
+    optimum (maximum total, then lexicographically smallest sorted group
+    encodings) for each subset.
+
+    The winning subset removes the fewest pairs; ties are broken by the
+    lexicographically smallest sorted ``(left_id, right_id)`` list.  When the
+    original optimum already reaches the target, nothing needs removing.  When
+    removing every pair still falls short, ``reachable`` is false,
+    ``removed_pairs`` is empty and ``max_total`` reports the best achievable
+    total.  This endpoint does not participate in ``Idempotency-Key`` replay.
+    """
+    reconciler, groups = solve_groups(payload)
+    original_total = sum(c.weight for c in groups)
+    outcome = recover_exclusions(reconciler, payload.target_total, groups)
+
+    result_groups = sorted(outcome.groups, key=lambda c: c.encoding)
+    result = reconcile_response(payload, result_groups)
+    return ExclusionRecoveryResponse(
+        reachable=outcome.reachable,
+        removed_pairs=[
+            ExcludedPairOut(left_id=lid, right_id=rid) for lid, rid in outcome.removed_pairs
+        ],
+        result=result,
+        original_total=original_total,
+        max_total=None if outcome.reachable else outcome.total,
     )
 
 

@@ -81,6 +81,30 @@ class ReconcileRequest(BaseModel):
     )
 
 
+class ExclusionRecoveryRequest(ReconcileRequest):
+    """Batch fields identical to ``ReconcileRequest`` plus a recovery target.
+
+    The batch validation (duplicate ids, ``locked_groups`` and
+    ``excluded_pairs``) is identical to ``POST /reconcile``.  ``excluded_pairs``
+    carries at most 8 entries; ``target_total`` is the desired total reconciled
+    amount (non-negative integer cents) the operator wants to reach by lifting
+    some of the exclusions.
+    """
+
+    target_total: StrictInt = Field(
+        ge=0,
+        description="Desired total reconciled amount in cents (non-negative integer).",
+    )
+    excluded_pairs: list[ExcludedPairIn] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Optional (left_id, right_id) pairs, at most 8, that must never "
+            "end up in the same reconciliation group."
+        ),
+    )
+
+
 class AuditRequest(ReconcileRequest):
     """Batch fields identical to ``ReconcileRequest`` plus an external plan.
 
@@ -108,6 +132,35 @@ class ReconcileResponse(BaseModel):
     total_amount: int  # sum of absolute reconciled amounts across groups
     unmatched_left_ids: list[str]
     unmatched_right_ids: list[str]
+
+
+class ExcludedPairOut(BaseModel):
+    """One removed exclusion: the same (left_id, right_id) shape as the input."""
+
+    left_id: str
+    right_id: str
+
+
+class ExclusionRecoveryResponse(BaseModel):
+    """Outcome of the exclusion-rule recovery suggestion.
+
+    - ``reachable``: the target total can be achieved by removing
+      ``removed_pairs``;
+    - ``removed_pairs``: the fewest exclusions to remove, sorted by
+      ``(left_id, right_id)`` (empty when the target is unreachable or already
+      met without removals);
+    - ``result``: the canonical reconciliation result under the suggested
+      removals; when unreachable, the result of removing every excluded pair;
+    - ``original_total``: the canonical total with all exclusions in force;
+    - ``max_total``: the best achievable total after removing every pair,
+      present only when ``reachable`` is false.
+    """
+
+    reachable: bool
+    removed_pairs: list[ExcludedPairOut]
+    result: ReconcileResponse
+    original_total: int
+    max_total: int | None = None
 
 
 DiagnosticReason = Literal[

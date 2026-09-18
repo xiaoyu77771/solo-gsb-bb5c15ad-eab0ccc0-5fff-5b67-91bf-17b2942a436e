@@ -533,6 +533,8 @@ class Reconciler:
         right: list[Txn],
         locked: Sequence[Candidate] = (),
         excluded_pairs: Sequence[tuple[str, str]] = (),
+        *,
+        candidates: Sequence[Candidate] | None = None,
     ) -> None:
         self.left = left
         self.right = right
@@ -550,7 +552,12 @@ class Reconciler:
             for lid, rid in self.excluded_pairs
         )
         self.amounts = [t.amount for t in self.txns]
-        self.candidates: list[Candidate] = self._generate_candidates()
+        # ``candidates`` lets a caller reuse an already-generated pool (e.g. a
+        # variant in which some excluded pairs were lifted); by default the pool
+        # is generated with every excluded pair applied.
+        self.candidates: list[Candidate] = (
+            list(candidates) if candidates is not None else self._generate_candidates()
+        )
         # encoding -> candidate; each encoding maps to exactly one candidate
         self.by_encoding: dict[tuple[tuple[str, ...], tuple[str, ...]], Candidate] = {
             c.encoding: c for c in self.candidates
@@ -748,3 +755,107 @@ class Reconciler:
             else:  # pragma: no cover - defensive, cannot happen if _max_value is exact
                 raise RuntimeError("no feasible candidate for the remaining optimum")
         return sorted(self.locked + solution, key=lambda c: c.encoding)
+
+
+@dataclass(frozen=True)
+class ExclusionRecoveryOutcome:
+    """Result of searching for exclusions that must be removed.
+
+    - ``reachable``: some subset of removed pairs lifts the optimum to at least
+      the requested target;
+    - ``removed_pairs``: the chosen pairs as sorted ``(left_id, right_id)``
+      tuples (empty when unreachable);
+    - ``groups``: the canonical optimum under the lifted restriction when
+      reachable, otherwise the canonical optimum with *every* pair removed;
+    - ``total``: that optimum's total reconciled amount.
+    """
+
+    reachable: bool
+    removed_pairs: tuple[tuple[str, str], ...]
+    groups: list[Candidate]
+    total: int
+
+
+def recover_exclusions(
+    rec: Reconciler,
+    target_total: int,
+    original_groups: Sequence[Candidate],
+) -> ExclusionRecoveryOutcome:
+    """Find the fewest excluded pairs whose removal lets the optimum reach a
+    target total, without touching the transactions or the locked groups.
+
+    ``rec`` must be the reconciler validated with every excluded pair applied
+    and must already carry the resolved locked candidates (``rec.locked``);
+    ``original_groups`` is its canonical optimum.  The original reconciler is
+    never mutated: a single candidate pool generated with no exclusions is
+    shared by lightweight variants, each keeping only the candidates that hit
+    none of its still-active pairs (locked candidates from ``rec`` resolve
+    identically in that pool).
+
+    Sets are tried in increasing cardinality; at equal cardinality the set whose
+    sorted ``(left_id, right_id)`` list is lexicographically smallest wins,
+    which ``itertools.combinations`` over the sorted pair list enumerates in
+    exactly that order.  When even removing every pair misses the target, the
+    all-pairs-removed optimum is returned as the best achievable total.
+    """
+    original_total = sum(c.weight for c in original_groups)
+    if original_total >= target_total:
+        return ExclusionRecoveryOutcome(
+            True, (), list(original_groups), original_total
+        )
+
+    excluded = sorted(rec.excluded_pairs)
+    if not excluded:
+        return ExclusionRecoveryOutcome(
+            False, (), list(original_groups), original_total
+        )
+
+    full = Reconciler(rec.left, rec.right, locked=rec.locked)
+
+    # Bitmask, over ``excluded``, of the pairs hit by each full-pool candidate.
+    hit_masks: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+    for pi, (lid, rid) in enumerate(excluded):
+        bit = 1 << pi
+        for cand in full.candidates:
+            if lid in cand.left_ids and rid in cand.right_ids:
+                enc = cand.encoding
+                hit_masks[enc] = hit_masks.get(enc, 0) | bit
+
+    def variant(active_pairs: set[tuple[str, str]]) -> Reconciler:
+        active_mask = 0
+        for pi, pair in enumerate(excluded):
+            if pair in active_pairs:
+                active_mask |= 1 << pi
+        kept = [
+            cand
+            for cand in full.candidates
+            if not (hit_masks.get(cand.encoding, 0) & active_mask)
+        ]
+        return Reconciler(
+            full.left,
+            full.right,
+            locked=full.locked,
+            excluded_pairs=active_pairs,
+            candidates=kept,
+        )
+
+    # Removing every pair gives the largest achievable total; when even that
+    # falls short, no subset can reach the target (monotonicity).
+    max_groups = full.solve()
+    max_total = sum(c.weight for c in max_groups)
+    if max_total < target_total:
+        return ExclusionRecoveryOutcome(False, (), max_groups, max_total)
+
+    # Enumerate removal sets by increasing size; the all-pairs set is already
+    # known feasible, so only proper subsets need a solve here.
+    for k in range(1, len(excluded)):
+        for chosen in combinations(excluded, k):
+            active = set(excluded) - set(chosen)
+            sub = variant(active)
+            groups = sub.solve()
+            if sum(c.weight for c in groups) >= target_total:
+                return ExclusionRecoveryOutcome(
+                    True, chosen, groups, sum(c.weight for c in groups)
+                )
+
+    return ExclusionRecoveryOutcome(True, tuple(excluded), max_groups, max_total)
