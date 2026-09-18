@@ -23,6 +23,13 @@ fixed order over every combination that could have contained it and reports
 the first filter that leaves nothing, or an optimisation conflict when legal
 candidates existed but the optimum selected none of them.
 
+``find_exclusion_recovery`` leaves the transactions and locked groups
+untouched and instead relaxes operator exclusions: it enumerates the
+exclusion-free legal candidates once, gives each candidate a bitmask of the
+excluded pairs it contains, then searches removal subsets (fewest pairs
+first, then the lexicographic order of sorted pair lists) for one whose
+canonical optimum reaches a requested target total.
+
 Group legality rules:
   * shapes: 1-1, or a single record on one side with 2-3 on the other;
   * every amount in the group shares the same sign;
@@ -533,6 +540,7 @@ class Reconciler:
         right: list[Txn],
         locked: Sequence[Candidate] = (),
         excluded_pairs: Sequence[tuple[str, str]] = (),
+        legal_candidates: Sequence[Candidate] | None = None,
     ) -> None:
         self.left = left
         self.right = right
@@ -550,7 +558,12 @@ class Reconciler:
             for lid, rid in self.excluded_pairs
         )
         self.amounts = [t.amount for t in self.txns]
-        self.candidates: list[Candidate] = self._generate_candidates()
+        # ``legal_candidates`` lets several reconcilers (recovery views over
+        # different excluded-pair subsets) reuse one enumeration of the
+        # exclusion-free legal candidates instead of regenerating them.
+        self.candidates: list[Candidate] = (
+            self._generate_candidates() if legal_candidates is None else list(legal_candidates)
+        )
         # encoding -> candidate; each encoding maps to exactly one candidate
         self.by_encoding: dict[tuple[tuple[str, ...], tuple[str, ...]], Candidate] = {
             c.encoding: c for c in self.candidates
@@ -748,3 +761,142 @@ class Reconciler:
             else:  # pragma: no cover - defensive, cannot happen if _max_value is exact
                 raise RuntimeError("no feasible candidate for the remaining optimum")
         return sorted(self.locked + solution, key=lambda c: c.encoding)
+
+
+@dataclass(frozen=True)
+class ExclusionRecoveryResult:
+    """Outcome of the fewest-exclusion-removal recovery search.
+
+    - ``reachable``: removing ``removed_pairs`` lets the canonical optimum meet
+      the target; ``False`` only when removing *every* excluded pair still
+      falls short;
+    - ``removed_pairs``: the fewest pairs to remove, sorted lexicographically
+      (empty when nothing must be or can be removed);
+    - ``groups``: the canonical optimum after applying ``removed_pairs`` -- the
+      all-pairs-removed optimum when the target is unreachable;
+    - ``original_total`` / ``max_total``: the canonical optimum total with all
+      exclusions in force / after removing every excluded pair.
+    """
+
+    reachable: bool
+    removed_pairs: tuple[tuple[str, str], ...]
+    groups: list[Candidate]
+    original_total: int
+    max_total: int
+
+
+def find_exclusion_recovery(rec: Reconciler, target_total: int) -> ExclusionRecoveryResult:
+    """Find the fewest excluded pairs whose removal reaches ``target_total``.
+
+    The transactions and the locked groups never change; only operator
+    exclusions are relaxed.  The exclusion-free reconciler enumerates every
+    legal candidate once, and per candidate a bitmask records which excluded
+    pairs it contains, so each removal subset gets its candidate pool by a
+    single mask filter.  Subsets are tried by increasing removed-pair count,
+    and within a count in the lexicographic order of the sorted
+    ``(left_id, right_id)`` pair lists, so the first subset whose canonical
+    optimum meets the target is the unique answer.  When removing all pairs
+    still falls short, the result is unreachable and no pairs are reported.
+    """
+    full_mask = (1 << len(rec.txns)) - 1
+    lock_mask = 0
+    locked_total = 0
+    for cand in rec.locked:
+        lock_mask |= cand.mask
+        locked_total += cand.weight
+    free_mask = full_mask ^ lock_mask
+
+    # k = 0: the original optimum with every excluded pair in force.
+    original_groups = rec.solve()
+    original_total = sum(c.weight for c in original_groups)
+
+    sorted_pairs = sorted(rec.excluded_pairs)
+    n = len(sorted_pairs)
+
+    # With no declared pairs nothing can be relaxed: the target is met by the
+    # original optimum alone, or it is permanently unreachable.
+    if n == 0:
+        return ExclusionRecoveryResult(
+            reachable=original_total >= target_total,
+            removed_pairs=(),
+            groups=original_groups,
+            original_total=original_total,
+            max_total=original_total,
+        )
+
+    # Enumerate the exclusion-free legal candidates once; per candidate,
+    # record the excluded pairs (bits into ``sorted_pairs``) it contains.
+    base = Reconciler(rec.left, rec.right, locked=rec.locked, excluded_pairs=())
+    index_pairs = [
+        (rec.left_index[lid], rec.n_left + rec.right_index[rid])
+        for lid, rid in sorted_pairs
+    ]
+    hit_masks: list[int] = []
+    for cand in base.candidates:
+        hit = 0
+        for p, (li, ri) in enumerate(index_pairs):
+            if cand.mask & (1 << li) and cand.mask & (1 << ri):
+                hit |= 1 << p
+        hit_masks.append(hit)
+    all_bits = (1 << n) - 1
+
+    def view_for(removed_bits: int) -> Reconciler:
+        remaining = all_bits ^ removed_bits
+        cands = [
+            cand
+            for cand, hit in zip(base.candidates, hit_masks)
+            if not hit & remaining
+        ]
+        return Reconciler(
+            rec.left,
+            rec.right,
+            locked=rec.locked,
+            legal_candidates=cands,
+        )
+
+    # k = n (remove everything) gives the hard upper bound; the optimum can
+    # only grow as more pairs are removed, so falling short here means no
+    # subset can ever reach the target.
+    full_view = view_for(all_bits)
+    max_total = locked_total + full_view._max_value(free_mask)
+
+    if original_total >= target_total:
+        return ExclusionRecoveryResult(
+            reachable=True,
+            removed_pairs=(),
+            groups=original_groups,
+            original_total=original_total,
+            max_total=max_total,
+        )
+
+    if max_total < target_total:
+        return ExclusionRecoveryResult(
+            reachable=False,
+            removed_pairs=(),
+            groups=full_view.solve(),
+            original_total=original_total,
+            max_total=max_total,
+        )
+
+    # Increasing removal counts; combinations() yields index tuples in
+    # lexicographic order, which is exactly the sorted pair-list order.
+    for k in range(1, n + 1):
+        for removed_idx in combinations(range(n), k):
+            removed_bits = 0
+            for p in removed_idx:
+                removed_bits |= 1 << p
+            if removed_bits == all_bits:
+                view = full_view
+            else:
+                view = view_for(removed_bits)
+            total = locked_total + view._max_value(free_mask)
+            if total >= target_total:
+                return ExclusionRecoveryResult(
+                    reachable=True,
+                    removed_pairs=tuple(sorted_pairs[p] for p in removed_idx),
+                    groups=view.solve(),
+                    original_total=original_total,
+                    max_total=max_total,
+                )
+
+    raise RuntimeError("unreachable recovery subset not detected by the upper bound")  # pragma: no cover

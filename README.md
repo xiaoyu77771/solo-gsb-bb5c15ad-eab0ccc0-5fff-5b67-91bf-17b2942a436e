@@ -356,6 +356,101 @@ curl -X POST http://localhost:8000/reconcile \
 
 该接口不参与 `Idempotency-Key` 幂等重放。
 
+### `POST /reconcile/exclusion-recovery`
+
+**排除规则恢复建议。** 在**不改动任何流水、不改动 `locked_groups`** 的前提下，回答：
+至少要**移除多少条 `excluded_pairs`**，才能使规范最优核销额（最大核销总额；并列时组编码
+排序列表字典序最小）达到目标值 `target_total`。
+
+请求体复用 `POST /reconcile` 的全部批次字段（`left` / `right` / `locked_groups` /
+`excluded_pairs`，批次级校验与 400/422 行为完全一致），并有两点额外约束：
+
+- `target_total` **必传**，必须是**非负整数**（单位：分）；负数、布尔、浮点、字符串、
+  缺失均返回 **422**，错误 `loc` 为 `["body", "target_total"]`；
+- `excluded_pairs` **最多 8 项**；超过 8 项返回 **422**，错误 `loc` 为
+  `["body", "excluded_pairs"]`。
+
+```json
+{
+  "left":  [
+    { "id": "A", "time": "2026-09-17T00:00:00Z", "amount": 100 },
+    { "id": "B", "time": "2026-09-17T00:00:00Z", "amount": 50 }
+  ],
+  "right": [
+    { "id": "X", "time": "2026-09-17T00:00:00Z", "amount": 150 },
+    { "id": "Y", "time": "2026-09-17T00:00:00Z", "amount": 100 }
+  ],
+  "excluded_pairs": [
+    { "left_id": "A", "right_id": "X" }
+  ],
+  "target_total": 150
+}
+```
+
+**搜索规则。** 服务端在“移除排除对子集 → 重新计算规范最优核销额”的空间中：
+
+1. 优先选择**移除条数最少**的子集；
+2. 移除条数相同时，把每个子集中的 `(left_id, right_id)` 对按字典序排序得到对列表，
+   取**列表字典序最小**的唯一方案；
+3. 规范最优核销额 **≥ `target_total`** 即视为达标（金额只取非负值）。
+
+流水与 `locked_groups` 全程不变；人工锁定组照常强制保留，仅在自由候选池上放松排除约束。
+
+**响应字段。**
+
+- `reachable`：是否存在满足目标的移除方案；
+- `removed_pairs`：建议移除的排除对（按 `(left_id, right_id)` 字典序升序）；
+  无需移除（现有最优已达标）或无法达标时为空数组 `[]`；
+- `result`：应用 `removed_pairs` 后的**标准核销结果**，结构与 `POST /reconcile` 的响应
+  完全相同（`groups` / `total_amount` / `unmatched_*`）；
+- `original_total`：保留全部排除对时的规范最优核销额（分）；
+- `max_total`：**仅在 `reachable` 为 `false` 时出现**——移除**全部**排除对后的规范最优
+  核销额，即可达到的硬上界（分）；达标时该字段不输出。
+
+达标响应示例（排除 `(A,X)` 使最优由 150 降为 100，移除该对即恢复）：
+
+```json
+{
+  "reachable": true,
+  "removed_pairs": [
+    { "left_id": "A", "right_id": "X" }
+  ],
+  "result": {
+    "groups": [
+      { "left_ids": ["A", "B"], "right_ids": ["X"], "amount": 150 }
+    ],
+    "total_amount": 150,
+    "unmatched_left_ids": [],
+    "unmatched_right_ids": ["Y"]
+  },
+  "original_total": 100
+}
+```
+
+现有最优已达标（含 `target_total` 为 0）时，`removed_pairs` 为空数组、`result` 即当前
+核销结果，且不输出 `max_total`。
+
+无法达标响应示例（移除全部排除对后最多核销 100，目标 101）：
+
+```json
+{
+  "reachable": false,
+  "removed_pairs": [],
+  "result": {
+    "groups": [
+      { "left_ids": ["A"], "right_ids": ["R1"], "amount": 100 }
+    ],
+    "total_amount": 100,
+    "unmatched_left_ids": [],
+    "unmatched_right_ids": ["R2"]
+  },
+  "original_total": 0,
+  "max_total": 100
+}
+```
+
+该接口不参与 `Idempotency-Key` 幂等重放。
+
 ### `POST /reconcile/diagnostics`
 
 诊断**最优解中每笔未匹配流水**的原因。请求体与 `POST /reconcile` 完全相同
@@ -428,6 +523,14 @@ curl -X POST http://localhost:8000/reconcile \
 ID 的候选组（锁定组若命中排除对则在求解前返回 422），步骤 2、3 在剩余候选集上
 照常执行。
 
+`/reconcile/exclusion-recovery` 在排除对最多 8 条的前提下：先一次性枚举**无任何排除对**
+时的全部合法候选组，并为每个候选组记录它命中的排除对位掩码；随后按“移除条数升序、
+同条数按排序后的 `(left_id, right_id)` 对列表字典序”枚举移除子集（至多 2⁸ = 256 个
+视图），每个视图用一次位掩码过滤得到候选池，再复用步骤 2 的备忘录分支限界求规范最优额；
+首个最优额达到 `target_total` 的子集即答案。先计算“移除全部排除对”的硬上界，低于目标
+时直接返回 `reachable=false` 与 `max_total`，不再枚举子集。流水与锁定组在所有视图中
+保持不变。
+
 实测 12×12 极端稠密批次求解耗时约 50ms 以内。
 
 ## 测试
@@ -440,16 +543,18 @@ pytest
 包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
 `excluded_pairs` 以及二者组合的场景），以及 `/reconcile/audit` 的逐组错误、
 金额次优与字典序次优场景测试、`/reconcile/diagnostics` 的六种诊断原因与
-候选列表（对照候选池的随机校验）测试。
+候选列表（对照候选池的随机校验）测试、`/reconcile/exclusion-recovery` 的最少移除数、
+字典序并列、不可达与锁定组场景测试（求解器层含对逐子集暴力枚举的随机差分校验）。
 
 ## 项目结构
 
 ```
 app/
   main.py         # FastAPI 入口与 /reconcile、/reconcile/audit、
-                  # /reconcile/unmatched-summary、/reconcile/diagnostics 端点
+                  # /reconcile/unmatched-summary、/reconcile/diagnostics、
+                  # /reconcile/exclusion-recovery 端点
   models.py       # 请求/响应模型与校验
-  solver.py       # 候选生成 + 最优互斥集求解 + 未匹配诊断
+  solver.py       # 候选生成 + 最优互斥集求解 + 未匹配诊断 + 排除恢复搜索
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化
 tests/            # pytest 测试
 Dockerfile

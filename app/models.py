@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
 MAX_TRANSACTIONS_PER_SIDE = 12
+MAX_EXCLUDED_PAIRS = 8
 
 
 class TransactionIn(BaseModel):
@@ -164,6 +165,59 @@ class AuditResponse(BaseModel):
     proposed_total: int
     optimal_total: int
     groups: list[GroupOut]
+
+
+class ExclusionRecoveryRequest(ReconcileRequest):
+    """Batch fields identical to ``ReconcileRequest`` plus a recovery target.
+
+    The service searches for the fewest operator-declared excluded pairs that
+    must be removed so the canonical optimum reaches ``target_total``.  At most
+    8 excluded pairs may be supplied (more return 422); ``target_total`` must
+    be a non-negative integer.
+    """
+
+    target_total: StrictInt = Field(
+        ge=0,
+        description="Desired canonical optimum total (sum of absolute group amounts, cents).",
+    )
+    excluded_pairs: list[ExcludedPairIn] | None = Field(
+        default=None,
+        max_length=MAX_EXCLUDED_PAIRS,
+        description=(
+            "At most 8 (left_id, right_id) pairs that must never end up in the "
+            "same reconciliation group."
+        ),
+    )
+
+
+class RemovedPairOut(BaseModel):
+    """One excluded pair suggested for removal."""
+
+    left_id: str
+    right_id: str
+
+
+class ExclusionRecoveryResponse(BaseModel):
+    """Outcome of the exclusion-rule recovery search.
+
+    - ``reachable``: whether removing the suggested pairs lets the canonical
+      optimum reach ``target_total``;
+    - ``removed_pairs``: the fewest pairs to remove (sorted lexicographically),
+      empty when the target is unreachable or already met without removals;
+    - ``result``: the standard reconciliation result after applying
+      ``removed_pairs`` (identical to the original result when nothing is
+      removed);
+    - ``original_total``: the canonical optimum total with every excluded pair
+      in force;
+    - ``max_total``: only present when ``reachable`` is ``false`` -- the optimum
+      total after removing *all* excluded pairs (the hard upper bound).
+    """
+
+    reachable: bool
+    removed_pairs: list[RemovedPairOut]
+    result: ReconcileResponse
+    original_total: int
+    max_total: int | None = None
 
 
 class UnmatchedSummaryRequest(ReconcileRequest):
